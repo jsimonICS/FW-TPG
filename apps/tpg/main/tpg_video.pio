@@ -1,0 +1,43 @@
+; Composite-sync + RGB test-pattern generator for the FreeWili OG breakout
+; header. Two state machines drive two physically disjoint pin groups --
+; GPIO 8-15 (8 bits: R2 R1 R0 G2 G1 G0 B2 B1) and GPIO 26-27 (2 bits: B0,
+; CSYNC) -- because those are the only ten breakout-header pins the
+; direction-control system (bsp/main_cpu/gpio/breakout.c) actually covers;
+; GPIO 16/17 are excluded (see apps/tpg's design notes: they are the I2C0
+; breakout pair and may not be plain push-pull capable).
+;
+; Both programs are the same shape -- pull one 32-bit word, apply it to the
+; pins, then hold for N more cycles -- so as long as neither DMA feed ever
+; lets its FIFO run dry, the two buses stay cycle-locked against each other
+; for the entire run (PIO execution is fully deterministic; nothing but a
+; FIFO stall can introduce drift between two SMs given identical per-word
+; cycle counts).
+;
+; Word format, video_pattern.c's packing:
+;   bits [0 : N-1]  = pin pattern (N = 8 for bus8, 2 for bus2)
+;   bits [N : 31]   = hold_cycles - 3
+;
+; The "-3" accounts for the two `out` instructions (1 cycle each) plus the
+; final loop iteration, which executes but does not branch when X reaches
+; zero: loading X=(hold-3) makes the `jmp x--` loop run exactly hold-2
+; times (X counts hold-3, hold-4, ..., 0 -- that is hold-2 distinct
+; iterations), and 2 (outs) + (hold-2) (loop) = hold cycles total, matching
+; the caller's intended hold_cycles exactly. video_pattern.c must never be
+; asked for a hold shorter than 3 cycles -- the tightest real segment here
+; is the 460-cycle equalizing pulse, far above that floor.
+
+.program tpg_bus8
+.wrap_target
+    out pins, 8
+    out x, 24
+delay8:
+    jmp x--, delay8
+.wrap
+
+.program tpg_bus2
+.wrap_target
+    out pins, 2
+    out x, 30
+delay2:
+    jmp x--, delay2
+.wrap
