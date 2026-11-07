@@ -79,7 +79,9 @@ The ZoomIO build shows an artifact of scan lines that periodically rolls down
 the image. The cause hasn't been found yet. The OG and FPGA builds don't show
 it, so for clean output on a FreeWili 2, use the FPGA build.
 
-<!-- VIDEO: paste the GitHub video link (https://github.com/user-attachments/assets/...) on its own line below -->
+Video of the artifact (click to play on YouTube):
+
+[![ZoomIO rolling scan-line artifact](https://img.youtube.com/vi/cUXcgxGAbs0/hqdefault.jpg)](https://youtu.be/cUXcgxGAbs0)
 
 ## Hardware
 
