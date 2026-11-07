@@ -35,6 +35,27 @@
 #define TPG_BAR_COUNT 8
 #define TPG_BAR_NS            (TPG_ACTIVE_NS / TPG_BAR_COUNT)   /* 6580 ns */
 
+/* --- Crosshatch grid geometry, shared by both crosshatch patterns. A closed
+ * grid of TPG_GRID_CELLS x 6 square cells (on a 4:3 screen): 9 vertical
+ * lines, the first starting the active region and the last ending it, and 7
+ * horizontal ones on active lines 0, 40, ..., 240 -- so both edges and the
+ * center carry a line, which is what H/V size, position and linearity get
+ * adjusted against. 8 pitches + one line fill TPG_ACTIVE_NS exactly, and
+ * every width is a multiple of 20 ns, so it is a whole number of cycles at
+ * both 200 MHz (here) and 150 MHz (the FW2 ZoomIO port, gen_tpg_zio.py).
+ * The optional dots sit at each cell's center. */
+#define TPG_GRID_CELLS           8u
+#define TPG_GRID_LINE_NS       320u
+#define TPG_GRID_PITCH_NS     6540u   /* one line's start to the next's */
+#define TPG_GRID_GAP_NS        (TPG_GRID_PITCH_NS - TPG_GRID_LINE_NS)
+#define TPG_GRID_DOT_NS        300u
+#define TPG_GRID_DOT_SIDE_NS   ((TPG_GRID_GAP_NS - TPG_GRID_DOT_NS) / 2u)   /* 2960 ns */
+#define TPG_GRID_ROW_SPACING    40u
+_Static_assert(TPG_GRID_CELLS * TPG_GRID_PITCH_NS + TPG_GRID_LINE_NS == TPG_ACTIVE_NS,
+               "crosshatch must span the active region exactly");
+_Static_assert(2u * TPG_GRID_DOT_SIDE_NS + TPG_GRID_DOT_NS == TPG_GRID_GAP_NS,
+               "dot must be centered in its cell");
+
 /* --- Vertical sync structure (EIA RS-170: 3 pre-eq + 3 vsync + 3 post-eq
  * lines, each carrying two half-line-rate pulses) --- */
 #define TPG_HALF_LINE_NS      (TPG_H_TOTAL_NS / 2)     /* 31780 ns */
@@ -50,8 +71,9 @@
 #define TPG_LINES_VSYNC          3u
 #define TPG_LINES_POST_EQ        3u
 #define TPG_LINES_PRE_BLANK     10u   /* ordinary blanked lines before active video */
-#define TPG_LINES_ACTIVE       240u   /* color-bar lines */
-#define TPG_LINES_POST_BLANK     3u   /* ordinary blanked lines after active video */
+#define TPG_LINES_ACTIVE       241u   /* 240 + 1 so the crosshatch's bottom edge
+                                         line lands a whole cell below the last */
+#define TPG_LINES_POST_BLANK     2u   /* ordinary blanked lines after active video */
 #define TPG_LINES_PER_FIELD \
     (TPG_LINES_PRE_EQ + TPG_LINES_VSYNC + TPG_LINES_POST_EQ + \
      TPG_LINES_PRE_BLANK + TPG_LINES_ACTIVE + TPG_LINES_POST_BLANK)   /* 262 */
@@ -62,13 +84,24 @@
 #define TPG_SEGS_PER_EQ_LINE     4u   /* pulse, high, pulse, high */
 #define TPG_SEGS_PER_VSYNC_LINE  4u   /* low, serration, low, serration */
 #define TPG_SEGS_PER_BLANK_LINE  4u   /* front porch, sync, back porch, blanked active */
-#define TPG_SEGS_PER_ACTIVE_LINE (3u + TPG_BAR_COUNT)  /* fp, sync, bp, N bars */
 
-#define TPG_FIELD_WORDS \
+/* Active-line segment count varies by pattern (video_pattern.c): bars,
+ * checkerboard and the solids/gradients use few segments; a crosshatch line
+ * is porches + a line and gap per cell + the closing line, and the worst is
+ * crosshatch+dots' dot lines (two per cell row), whose gaps split into
+ * gap/dot/gap. TPG_FIELD_WORDS_MAX sizes the shared field buffers for that
+ * worst case; tpg_pattern_build() returns the actual word count it wrote for
+ * whichever pattern was requested, which is always <= this. */
+#define TPG_SEGS_PER_GRID_LINE   (3u + 2u * TPG_GRID_CELLS + 1u)   /* 20 */
+#define TPG_SEGS_PER_DOT_LINE    (3u + 4u * TPG_GRID_CELLS + 1u)   /* 36 */
+#define TPG_GRID_DOT_LINES       (2u * (TPG_LINES_ACTIVE / TPG_GRID_ROW_SPACING))
+
+#define TPG_FIELD_WORDS_MAX \
     ((TPG_LINES_PRE_EQ + TPG_LINES_POST_EQ) * TPG_SEGS_PER_EQ_LINE + \
      TPG_LINES_VSYNC * TPG_SEGS_PER_VSYNC_LINE + \
      (TPG_LINES_PRE_BLANK + TPG_LINES_POST_BLANK) * TPG_SEGS_PER_BLANK_LINE + \
-     TPG_LINES_ACTIVE * TPG_SEGS_PER_ACTIVE_LINE)   /* 2728 */
+     TPG_GRID_DOT_LINES * TPG_SEGS_PER_DOT_LINE + \
+     (TPG_LINES_ACTIVE - TPG_GRID_DOT_LINES) * TPG_SEGS_PER_GRID_LINE)   /* 5096 */
 
 /* ns -> PIO cycles at the CURRENT clk_sys, rounded to nearest. Call once
  * clocks are up; never hardcode 200 MHz here even though this BSP's

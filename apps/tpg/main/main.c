@@ -21,36 +21,58 @@
 #include "video_timing.h"
 #include "video_pattern.h"
 #include "tpg_video.pio.h"
+#include "common/link/link_frame.h"
+#include "common/link/link_uart.h"
+#include "common/tpg_link_proto.h"
 
 FWOG_WATCHDOG_DEFAULT();
 
-static uint32_t s_bus8_words[TPG_FIELD_WORDS];
-static uint32_t s_bus2_words[TPG_FIELD_WORDS];
+static uint32_t s_bus8_words[TPG_FIELD_WORDS_MAX];
+static uint32_t s_bus2_words[TPG_FIELD_WORDS_MAX];
+/* Actual word count for whichever pattern is live -- <= TPG_FIELD_WORDS_MAX,
+ * and only ever changed together with the buffers above, from the main
+ * loop's link-poll below. rearm() (called both from here and from the DMA
+ * IRQ handler) always transfers exactly this many words. */
+static uint32_t s_field_words;
+static tpg_pattern_id_t s_pattern = TPG_PATTERN_COLOR_BARS;
+
+/* Receives FWOG_TPG_MSG_SET_PATTERN from the display CPU (apps/tpg/display/
+ * main.c), which owns the button-driven pattern selection. File-scope, not a
+ * local: fwog_link_rx_t embeds uint8_t buf[FWOG_LINK_MAX_PAYLOAD] (4160
+ * bytes), so the struct is far too big for a stack frame -- see breakout.c's
+ * identical reasoning for s_ack_rx. */
+static fwog_link_rx_t s_link_rx;
 
 static uint s_bus8_dma, s_bus2_dma;
 static PIO const s_pio = pio0;
 static uint s_sm8, s_sm2;
 
-/* Re-arms one channel for another full-field, one-shot transfer. Called
- * once per field (~16.7 ms) from the DMA IRQ -- not remotely timing
- * critical, unlike a per-line or per-pixel rearm would be. */
-static void rearm(uint channel, volatile void *fifo, const uint32_t *buf, uint dreq) {
+/* Re-arms one channel for another full-field, one-shot transfer of `count`
+ * words (the live pattern's actual length, s_field_words -- always <=
+ * TPG_FIELD_WORDS_MAX, so this never reads past either buffer even if it
+ * races a pattern change; see s_field_words's doc above). Called once per
+ * field (~16.7 ms) from the DMA IRQ -- not remotely timing critical, unlike
+ * a per-line or per-pixel rearm would be. */
+static void rearm(uint channel, volatile void *fifo, const uint32_t *buf,
+                  uint dreq, uint32_t count) {
     dma_channel_config c = dma_channel_get_default_config(channel);
     channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
     channel_config_set_read_increment(&c, true);
     channel_config_set_write_increment(&c, false);
     channel_config_set_dreq(&c, dreq);
-    dma_channel_configure(channel, &c, fifo, buf, TPG_FIELD_WORDS, true);
+    dma_channel_configure(channel, &c, fifo, buf, count, true);
 }
 
 static void dma_irq0_handler(void) {
     if (dma_channel_get_irq0_status(s_bus8_dma)) {
         dma_channel_acknowledge_irq0(s_bus8_dma);
-        rearm(s_bus8_dma, &s_pio->txf[s_sm8], s_bus8_words, pio_get_dreq(s_pio, s_sm8, true));
+        rearm(s_bus8_dma, &s_pio->txf[s_sm8], s_bus8_words,
+              pio_get_dreq(s_pio, s_sm8, true), s_field_words);
     }
     if (dma_channel_get_irq0_status(s_bus2_dma)) {
         dma_channel_acknowledge_irq0(s_bus2_dma);
-        rearm(s_bus2_dma, &s_pio->txf[s_sm2], s_bus2_words, pio_get_dreq(s_pio, s_sm2, true));
+        rearm(s_bus2_dma, &s_pio->txf[s_sm2], s_bus2_words,
+              pio_get_dreq(s_pio, s_sm2, true), s_field_words);
     }
 }
 
@@ -63,7 +85,17 @@ static void dma_irq0_handler(void) {
  * 12-15 (which double as the FPGA's own SPI bus during this call) are safe
  * to hand to PIO afterward and keep indefinitely -- see ice40.c's
  * spi_claim()/spi_release(), which only fire on an explicit call like this
- * one, never in the background. */
+ * one, never in the background.
+ *
+ * Retried until TPG_IO_CLAIM_MS: this runs straight after RUN, while
+ * tpg_display is still in board_init()/LCD init and not yet draining the
+ * link, so the first attempt's 250 ms ack waits (FWOG_IO_ACK_TIMEOUT_MS) can
+ * expire before the display ever looks. A later successful apply also
+ * repairs any half-applied state a failed one left (breakout.h). Must finish
+ * before PIO takes pins 12-15, hence bounded here rather than retried from
+ * the main loop. */
+#define TPG_IO_CLAIM_MS 3000u
+
 static bool claim_breakout_pins_as_outputs(void) {
     fwog_io_cfg_t cfg;
     fwog_io_cfg_default(&cfg);
@@ -79,9 +111,18 @@ static bool claim_breakout_pins_as_outputs(void) {
     cfg.gpio27_out = true;    /* GPIO 27 */
     cfg.gpio25_out = true;    /* PIN_LED; fwog_io_dir_apply() rejects false */
 
-    fwog_io_result_t r = fwog_io_dir_apply(&cfg);
+    const absolute_time_t deadline = make_timeout_time_ms(TPG_IO_CLAIM_MS);
+    unsigned attempts = 0u;
+    fwog_io_result_t r;
+    do {
+        board_watchdog_kick();
+        r = fwog_io_dir_apply(&cfg);
+        attempts++;
+    } while (r != FWOG_IO_OK && r != FWOG_IO_ERR_UNSUPPORTED &&
+             !time_reached(deadline));
     if (r != FWOG_IO_OK) {
-        DIAG("[tpg] fwog_io_dir_apply failed: %d\n", (int)r);
+        DIAG("[tpg] fwog_io_dir_apply failed: %d after %u attempts\n",
+             (int)r, attempts);
         return false;
     }
     return true;
@@ -109,7 +150,8 @@ int main(void) {
     bool io_ok = claim_breakout_pins_as_outputs();
 
     uint32_t sys_hz = clock_get_hz(clk_sys);
-    tpg_pattern_build(s_bus8_words, s_bus2_words, sys_hz);
+    s_field_words = tpg_pattern_build(s_bus8_words, s_bus2_words, sys_hz, s_pattern);
+    fwog_link_rx_init(&s_link_rx);
 
     s_sm8 = pio_claim_unused_sm(s_pio, true);
     s_sm2 = pio_claim_unused_sm(s_pio, true);
@@ -138,19 +180,43 @@ int main(void) {
     /* Prime both FIFOs before the SMs start consuming, then start both SMs
      * on the same cycle so bus8/bus2 begin their first `out pins` in lock
      * step. */
-    rearm(s_bus8_dma, &s_pio->txf[s_sm8], s_bus8_words, pio_get_dreq(s_pio, s_sm8, true));
-    rearm(s_bus2_dma, &s_pio->txf[s_sm2], s_bus2_words, pio_get_dreq(s_pio, s_sm2, true));
+    rearm(s_bus8_dma, &s_pio->txf[s_sm8], s_bus8_words,
+          pio_get_dreq(s_pio, s_sm8, true), s_field_words);
+    rearm(s_bus2_dma, &s_pio->txf[s_sm2], s_bus2_words,
+          pio_get_dreq(s_pio, s_sm2, true), s_field_words);
     pio_enable_sm_mask_in_sync(s_pio, (1u << s_sm8) | (1u << s_sm2));
 
     const absolute_time_t announce_until = make_timeout_time_ms(10000);
+    absolute_time_t next_report = make_timeout_time_ms(0);
     while (true) {
         board_watchdog_kick();
-        if (!time_reached(announce_until)) {
-            DIAG("[tpg_main] display: %s io_dir: %s\n",
-                 fwog_display_result_text(d), io_ok ? "ok" : "FAILED");
-        } else {
-            DIAG("[tpg_main] alive\n");
+
+        /* Non-blocking drain of the display's pattern-select events. See
+         * tpg_link_proto.h -- absolute pattern id, no ack. The link itself
+         * was already brought up by fwog_display_update_run() above; this
+         * loop just services it afterward, the same way breakout.c's
+         * wait_ack() does for its own (main-initiated) requests. */
+        uint8_t link_byte;
+        while (fwog_link_uart_read(&link_byte)) {
+            size_t len = 0u;
+            if (!fwog_link_rx_byte(&s_link_rx, link_byte, &len)) continue;
+            if (tpg_link_proto_type(s_link_rx.buf, len) != FWOG_TPG_MSG_SET_PATTERN) continue;
+            const tpg_set_pattern_t *m = (const tpg_set_pattern_t *)s_link_rx.buf;
+            if (m->pattern_id >= TPG_PATTERN_COUNT) continue;
+            s_pattern = (tpg_pattern_id_t)m->pattern_id;
+            s_field_words = tpg_pattern_build(s_bus8_words, s_bus2_words, sys_hz, s_pattern);
         }
-        sleep_ms(500);
+
+        /* Poll fast (button response), report slowly. */
+        if (time_reached(next_report)) {
+            next_report = make_timeout_time_ms(2000);
+            if (!time_reached(announce_until)) {
+                DIAG("[tpg_main] display: %s io_dir: %s\n",
+                     fwog_display_result_text(d), io_ok ? "ok" : "FAILED");
+            } else {
+                DIAG("[tpg_main] alive, pattern=%u\n", (unsigned)s_pattern);
+            }
+        }
+        sleep_ms(2);
     }
 }

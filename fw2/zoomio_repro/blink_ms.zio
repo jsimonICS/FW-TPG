@@ -1,0 +1,11 @@
+; Square wave on header GPIO 25, 250 ms per level, real-time unit.
+; Identical to zio_probe's MS program (the unused alias is kept so the two
+; compile to the same code).
+setiodir 25, 1
+name cnt = a0
+while 1
+    setio 25, 1
+    wait 250 ms
+    setio 25, 0
+    wait 250 ms
+endwhile

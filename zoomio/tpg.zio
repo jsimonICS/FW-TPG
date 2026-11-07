@@ -1,0 +1,306 @@
+; ZoomIO port of apps/tpg (wiliOGbsp) -- a 15.734 kHz RGB + composite-sync
+; test-pattern generator, retargeted from the FreeWili OG's breakout header
+; (PIO + DMA) to the FreeWili2's 20-pin (Orca) header via ZoomIO on the main
+; RP2350's core1.
+;
+; ARCHITECTURE DIFFERENCE FROM THE ORIGINAL: apps/tpg drives two PIO state
+; machines that each apply a full pin-group word in ONE instruction
+; (`out pins, N`), fed by DMA from a precomputed one-field buffer -- the CPU
+; never touches a pin directly. ZoomIO has no atomic multi-pin write; `setio`
+; touches exactly one pin per instruction, and there is no lookup-table /
+; memory read, so the whole field is generated LIVE by this script's own
+; control flow (loops standing in for the DMA's line/field repeat) rather
+; than played back from a precomputed buffer.
+;
+; Every `wait` below is a compile-time-exact cycle count, same as PIO's own
+; deterministic per-cycle timing -- but a multi-bit color change (bar to bar)
+; now takes ~18 cycles (~120 ns @ 150 MHz) to land across all 9 RGB pins
+; instead of landing atomically in one instruction. That skew is negligible
+; against a 987-cycle (6.58 us) bar hold and does not touch CSYNC (a single
+; pin, always atomic) -- so hsync/vsync edges stay exactly as clean as the
+; PIO version. A fast scope on the RGB lines WILL show a brief transitional
+; color at every bar edge, though; flag if that matters for your use case.
+;
+; CLOCK RATE ASSUMED: 150 MHz (ZoomIO's documented default). Confirm the
+; Controls panel / on-device config still matches before trusting the cycle
+; counts below -- if the clock differs, every constant here must be
+; recomputed (they will no longer divide evenly).
+;
+; PIN MAP -- FreeWili2 20-pin header, valid GPIOs per docs.freewili.com are
+; 8,9,10,11,12,13,14,15,16,17,25,26,27. Ten of those are used below; GPIO 11
+; is skipped on purpose (its `setio` costs 3 instructions instead of 2, which
+; would break the uniform 2-cycle-per-setio accounting used throughout this
+; script). GPIO 26/27 are left free.
+;
+;   R2 = GPIO  8      G2 = GPIO 12      B2 = GPIO 15
+;   R1 = GPIO  9      G1 = GPIO 13      B1 = GPIO 16
+;   R0 = GPIO 10      G0 = GPIO 14      B0 = GPIO 17
+;   CSYNC = GPIO 25 (active-low: 0 = sync asserted, 1 = idle)
+;
+; GPIO 12-15 double as SPI1 and GPIO 16/17 as I2C0 on this header (per
+; docs.freewili.com/hardware/pinout) -- fine to drive as plain push-pull GPIO
+; as long as nothing else on the board is actively using SPI1/I2C0 while this
+; script runs. NOT verified against real hardware defaults (e.g. whether the
+; stock firmware leaves an I2C0 pull-up enabled on 16/17) -- a driven output
+; should override a pull-up electrically, but confirm on a scope before
+; trusting it.
+;
+; TIMING SOURCE: apps/tpg/main/video_timing.h (EIA RS-170-derived --
+; UNVERIFIED ON HARDWARE there either; this ports the numbers, not any
+; assumed correctness). Cycle counts = ns * 150 / 1000; every constant in
+; video_timing.h divides evenly by the resulting 6.667 ns period at 150 MHz:
+;
+;   FRONT_PORCH     =  228 cycles  ( 1520 ns)
+;   HSYNC           =  705 cycles  ( 4700 ns)
+;   BACK_PORCH      =  705 cycles  ( 4700 ns)
+;   BAR             =  987 cycles  ( 6580 ns; x8 bars = 7896 = ACTIVE)
+;   ACTIVE (blanked)= 7896 cycles  (52640 ns; whole active region, one hold)
+;   EQ_PULSE        =  345 cycles  ( 2300 ns)
+;   EQ_HIGH         = 4422 cycles  (29480 ns)
+;   VSYNC_LOW       = 4062 cycles  (27080 ns)
+;   VSYNC_SERRATION =  705 cycles  ( 4700 ns; same width as HSYNC)
+;
+; Every `wait` value below is (segment's cycle count - setio overhead already
+; spent this segment), so instructions + wait always sum to the segment's
+; exact target -- the same accounting apps/tpg's video_pattern.c emit() does
+; for the PIO version's fixed 3-cycle loop overhead. Each of the four line
+; shapes (eq / vsync / blank / active) sums to exactly 9534 cycles
+; (TPG_H_TOTAL_NS = 63560 ns) -- checked by hand below each block.
+;
+; FIELD LAYOUT (video_timing.h): 3 pre-eq + 3 vsync + 3 post-eq + 10
+; pre-blank + 240 active (8-bar) + 3 post-blank lines = 262 lines/field,
+; repeated forever. 262 lines * 9534 cycles = 2,497,908 cycles/field =
+; ~16.65 ms at 150 MHz -- matches the ~16.7 ms field period apps/tpg's DMA
+; IRQ re-arms at.
+;
+; STATE INVARIANT carried between blocks (verified by hand, not just
+; asserted): every block below starts AND ends with CSYNC idle (1) and
+; RGB = 0 (black) -- except mid-block, where the shape's own sync pulses and
+; (for the active line) the 8 bars are expected. Bar 7 (the last of the
+; classic 8-bar sequence) is black, so the active-line loop naturally lands
+; back on RGB = 0 before its own next iteration's front porch -- no extra
+; reset instructions are needed anywhere.
+
+; ---------------------------------------------------------------------
+; One-time init
+; ---------------------------------------------------------------------
+setiodir 8, 1
+setiodir 9, 1
+setiodir 10, 1
+setiodir 12, 1
+setiodir 13, 1
+setiodir 14, 1
+setiodir 15, 1
+setiodir 16, 1
+setiodir 17, 1
+setiodir 25, 1
+
+; RGB pins reset low already (GPIO_OUT defaults to 0, i.e. black) -- only
+; CSYNC needs to be forced to its idle level before the first line runs.
+setio 25, 1
+
+name cnt = a0
+
+while 1
+    ; -------------------------------------------------------------
+    ; 3 pre-equalizing lines: two 2.3 us pulses at half-line spacing,
+    ; RGB blanked. Per-line total: (343+2)+(4420+2)+(343+2)+(4420+2)
+    ;   = 345+4422+345+4422 = 9534 cycles.
+    ; -------------------------------------------------------------
+    let cnt = 0
+    while cnt < 3
+        setio 25, 0
+        wait 343 cycles
+        setio 25, 1
+        wait 4420 cycles
+        setio 25, 0
+        wait 343 cycles
+        setio 25, 1
+        wait 4420 cycles
+        let cnt++
+    endwhile
+
+    ; -------------------------------------------------------------
+    ; 3 vertical-sync lines: two serrated broad pulses at half-line
+    ; spacing. Per-line total: (4060+2)+(703+2)+(4060+2)+(703+2)
+    ;   = 4062+705+4062+705 = 9534 cycles.
+    ; -------------------------------------------------------------
+    let cnt = 0
+    while cnt < 3
+        setio 25, 0
+        wait 4060 cycles
+        setio 25, 1
+        wait 703 cycles
+        setio 25, 0
+        wait 4060 cycles
+        setio 25, 1
+        wait 703 cycles
+        let cnt++
+    endwhile
+
+    ; -------------------------------------------------------------
+    ; 3 post-equalizing lines (identical shape to pre-eq; ZoomIO has
+    ; no callable subroutines, so the block is duplicated rather than
+    ; shared).
+    ; -------------------------------------------------------------
+    let cnt = 0
+    while cnt < 3
+        setio 25, 0
+        wait 343 cycles
+        setio 25, 1
+        wait 4420 cycles
+        setio 25, 0
+        wait 343 cycles
+        setio 25, 1
+        wait 4420 cycles
+        let cnt++
+    endwhile
+
+    ; -------------------------------------------------------------
+    ; 10 pre-blank lines: ordinary hsync line, active region fully
+    ; blanked (RGB already 0, held for the whole active-region hold
+    ; instead of being split into bars).
+    ; Per-line total: 228 + (703+2) + (703+2) + 7896
+    ;   = 228+705+705+7896 = 9534 cycles.
+    ; -------------------------------------------------------------
+    let cnt = 0
+    while cnt < 10
+        wait 228 cycles
+        setio 25, 0
+        wait 703 cycles
+        setio 25, 1
+        wait 703 cycles
+        wait 7896 cycles
+        let cnt++
+    endwhile
+
+    ; -------------------------------------------------------------
+    ; 240 active (color-bar) lines. Classic 8-bar sequence, full
+    ; 3-bit scale (0 or 7 only, so each channel is either all-1 or
+    ; all-0 across its 3 pins): white, yellow, cyan, green, magenta,
+    ; red, blue, black.
+    ; Per-line total: 228 + (703+2) + (703+2) + 8*(18+969)
+    ;   = 228+705+705+8*987 = 228+705+705+7896 = 9534 cycles.
+    ; -------------------------------------------------------------
+    let cnt = 0
+    while cnt < 240
+        wait 228 cycles           ; front porch (RGB=0, CSYNC idle already)
+        setio 25, 0
+        wait 703 cycles           ; hsync
+        setio 25, 1
+        wait 703 cycles           ; back porch
+
+        ; bar 0: white (R=7 G=7 B=7)
+        setio 8, 1
+        setio 9, 1
+        setio 10, 1
+        setio 12, 1
+        setio 13, 1
+        setio 14, 1
+        setio 15, 1
+        setio 16, 1
+        setio 17, 1
+        wait 969 cycles
+
+        ; bar 1: yellow (R=7 G=7 B=0)
+        setio 8, 1
+        setio 9, 1
+        setio 10, 1
+        setio 12, 1
+        setio 13, 1
+        setio 14, 1
+        setio 15, 0
+        setio 16, 0
+        setio 17, 0
+        wait 969 cycles
+
+        ; bar 2: cyan (R=0 G=7 B=7)
+        setio 8, 0
+        setio 9, 0
+        setio 10, 0
+        setio 12, 1
+        setio 13, 1
+        setio 14, 1
+        setio 15, 1
+        setio 16, 1
+        setio 17, 1
+        wait 969 cycles
+
+        ; bar 3: green (R=0 G=7 B=0)
+        setio 8, 0
+        setio 9, 0
+        setio 10, 0
+        setio 12, 1
+        setio 13, 1
+        setio 14, 1
+        setio 15, 0
+        setio 16, 0
+        setio 17, 0
+        wait 969 cycles
+
+        ; bar 4: magenta (R=7 G=0 B=7)
+        setio 8, 1
+        setio 9, 1
+        setio 10, 1
+        setio 12, 0
+        setio 13, 0
+        setio 14, 0
+        setio 15, 1
+        setio 16, 1
+        setio 17, 1
+        wait 969 cycles
+
+        ; bar 5: red (R=7 G=0 B=0)
+        setio 8, 1
+        setio 9, 1
+        setio 10, 1
+        setio 12, 0
+        setio 13, 0
+        setio 14, 0
+        setio 15, 0
+        setio 16, 0
+        setio 17, 0
+        wait 969 cycles
+
+        ; bar 6: blue (R=0 G=0 B=7)
+        setio 8, 0
+        setio 9, 0
+        setio 10, 0
+        setio 12, 0
+        setio 13, 0
+        setio 14, 0
+        setio 15, 1
+        setio 16, 1
+        setio 17, 1
+        wait 969 cycles
+
+        ; bar 7: black (R=0 G=0 B=0) -- leaves RGB at 0 for the next
+        ; iteration's front porch, and for post-blank once the loop ends.
+        setio 8, 0
+        setio 9, 0
+        setio 10, 0
+        setio 12, 0
+        setio 13, 0
+        setio 14, 0
+        setio 15, 0
+        setio 16, 0
+        setio 17, 0
+        wait 969 cycles
+
+        let cnt++
+    endwhile
+
+    ; -------------------------------------------------------------
+    ; 3 post-blank lines (identical shape to pre-blank).
+    ; -------------------------------------------------------------
+    let cnt = 0
+    while cnt < 3
+        wait 228 cycles
+        setio 25, 0
+        wait 703 cycles
+        setio 25, 1
+        wait 703 cycles
+        wait 7896 cycles
+        let cnt++
+    endwhile
+endwhile

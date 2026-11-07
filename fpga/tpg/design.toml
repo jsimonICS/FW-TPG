@@ -1,0 +1,30 @@
+[design]
+name          = "tpg"
+description   = "15 kHz RGB test pattern generator: 3-3-3 color + CSYNC; regs 0x10 pattern, 0x11 field count, 0x12 count, 0x13 text overlay"
+version       = "003"
+design_id     = 21584                # 0x5450 "TP": well clear of the wilifpga examples (1..9)
+kind          = "user"
+clock_hz      = 25000000             # 40 ns per clock, integer divider (no 31.25 MHz jitter)
+capabilities  = ["IO_BUFFER"]
+repository    = "TPG (fpga/tpg)"
+include_dirs  = ["designs/tpg/tb"]   # tb/tpg_text_model.vh (generated) for the testbench
+
+# All ten header signals are video outputs, the same pins as the OG and the
+# ZoomIO port (apps/tpg/main/video_pattern.h). MSB first per channel:
+#   blue  B2 GPIO8 uart_tx,   B1 GPIO9 uart_rx,   B0 GPIO10 uart_cts
+#   green G2 GPIO11 uart_rts, G1 GPIO12 spi_miso, G0 GPIO13 spi_cs
+#   red   R2 GPIO14 spi_sclk, R1 GPIO15 spi_mosi, R0 GPIO26
+#   CSYNC GPIO27 (active low)
+# wilifpga AGENTS.md says uart_rx (GPIO9) as FPGA_OUT "did not drive the
+# header pin in testing"; on our FW2 (v11-preview.1) it does (CRT, 2026-11-05).
+[io_profile]
+spi_miso = "FPGA_OUT"
+spi_cs   = "FPGA_OUT"
+spi_sclk = "FPGA_OUT"
+spi_mosi = "FPGA_OUT"
+uart_tx  = "FPGA_OUT"
+uart_rx  = "FPGA_OUT"
+uart_cts = "FPGA_OUT"
+uart_rts = "FPGA_OUT"
+gpio26   = "FPGA_OUT"
+gpio27   = "FPGA_OUT"

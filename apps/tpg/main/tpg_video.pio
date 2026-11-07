@@ -1,6 +1,6 @@
 ; Composite-sync + RGB test-pattern generator for the FreeWili OG breakout
 ; header. Two state machines drive two physically disjoint pin groups --
-; GPIO 8-15 (8 bits: R2 R1 R0 G2 G1 G0 B2 B1) and GPIO 26-27 (2 bits: B0,
+; GPIO 8-15 (8 bits: B2 B1 B0 G2 G1 G0 R2 R1) and GPIO 26-27 (2 bits: R0,
 ; CSYNC) -- because those are the only ten breakout-header pins the
 ; direction-control system (bsp/main_cpu/gpio/breakout.c) actually covers;
 ; GPIO 16/17 are excluded (see apps/tpg's design notes: they are the I2C0

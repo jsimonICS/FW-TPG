@@ -40,7 +40,10 @@ endif()
 
 add_subdirectory(wiliOGbsp/bsp)
 
+add_subdirectory(wiliOGbsp/apps/bl)
+
 # template_display is tpg_main's embedded display companion (tpg has none of
 # its own) -- must be declared before apps/tpg.
 add_subdirectory(wiliOGbsp/apps/template)
 add_subdirectory(apps/tpg)
+add_subdirectory(apps/btntest)

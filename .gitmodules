@@ -1,3 +1,12 @@
 [submodule "wilibsp"]
 	path = wilibsp
 	url = https://github.com/evaderkrub/wilibsp.git
+[submodule "wiliOGbsp"]
+	path = wiliOGbsp
+	url = https://github.com/freewili/wiliOGbsp.git
+[submodule "freewili-gui"]
+	path = freewili-gui
+	url = https://github.com/freewili/freewili-gui.git
+[submodule "wilifpga"]
+	path = wilifpga
+	url = https://github.com/freewili/wilifpga

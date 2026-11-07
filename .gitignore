@@ -1,0 +1,8 @@
+# build output
+build/
+build-fw2/
+__pycache__/
+*.pyc
+
+# downloaded FreeWili GUI releases (vendor binaries)
+fwcom-*/

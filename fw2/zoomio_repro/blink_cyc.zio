@@ -1,0 +1,11 @@
+; Square wave on header GPIO 25, 37,500,000 cycles per level -- 250 ms at
+; ZoomIO's documented 150 MHz, i.e. nominally identical to blink_ms.zio.
+; Identical to zio_probe's CYC program.
+setiodir 25, 1
+name cnt = a0
+while 1
+    setio 25, 1
+    wait 37500000 cycles
+    setio 25, 0
+    wait 37500000 cycles
+endwhile
